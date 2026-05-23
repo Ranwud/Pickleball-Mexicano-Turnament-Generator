@@ -1,6 +1,6 @@
-import { get, put } from '@vercel/blob'
+import { get, list, put } from '@vercel/blob'
 
-const STATE_PATHNAME = 'pickleball-mexicano/shared-state.json'
+const SNAPSHOT_PREFIX = 'pickleball-mexicano/snapshots/'
 
 const defaultState = {
   tournamentName: 'Saturday Mexicano Cup',
@@ -23,8 +23,39 @@ function jsonResponse(body, init = {}) {
   })
 }
 
-async function readState() {
-  const blob = await get(STATE_PATHNAME, {
+async function readBlobText(blob) {
+  if (typeof blob.text === 'function') {
+    return blob.text()
+  }
+
+  if (blob.body) {
+    return new Response(blob.body).text()
+  }
+
+  if (blob.stream) {
+    const stream = typeof blob.stream === 'function' ? blob.stream() : blob.stream
+    return new Response(stream).text()
+  }
+
+  throw new Error('Blob payload is missing a readable body')
+}
+
+async function readLatestState() {
+  const { blobs } = await list({
+    prefix: SNAPSHOT_PREFIX,
+    limit: 1000,
+  })
+
+  if (!blobs.length) {
+    return {
+      state: defaultState,
+      updatedAt: null,
+      pathname: null,
+    }
+  }
+
+  const latestBlob = blobs[blobs.length - 1]
+  const blob = await get(latestBlob.url, {
     access: 'private',
   })
 
@@ -32,23 +63,11 @@ async function readState() {
     return {
       state: defaultState,
       updatedAt: null,
+      pathname: null,
     }
   }
 
-  let data = null
-
-  if (typeof blob.text === 'function') {
-    data = await blob.text()
-  } else if (blob.body) {
-    data = await new Response(blob.body).text()
-  } else if (blob.stream) {
-    const stream = typeof blob.stream === 'function' ? blob.stream() : blob.stream
-    data = await new Response(stream).text()
-  } else {
-    throw new Error('Blob payload is missing a readable body')
-  }
-
-  const parsed = JSON.parse(data)
+  const parsed = JSON.parse(await readBlobText(blob))
 
   return {
     state: {
@@ -56,12 +75,13 @@ async function readState() {
       ...parsed.state,
     },
     updatedAt: parsed.updatedAt ?? null,
+    pathname: latestBlob.pathname,
   }
 }
 
 export async function GET() {
   try {
-    const payload = await readState()
+    const payload = await readLatestState()
     return jsonResponse(payload)
   } catch (error) {
     return jsonResponse(
@@ -82,15 +102,17 @@ export async function POST(request) {
       ...body?.state,
     }
 
+    const updatedAt = new Date().toISOString()
+    const pathname = `${SNAPSHOT_PREFIX}${Date.now().toString().padStart(13, '0')}.json`
     const payload = {
       state: nextState,
-      updatedAt: new Date().toISOString(),
+      updatedAt,
+      pathname,
     }
 
-    await put(STATE_PATHNAME, JSON.stringify(payload), {
+    await put(pathname, JSON.stringify(payload), {
       access: 'private',
       contentType: 'application/json',
-      allowOverwrite: true,
     })
 
     return jsonResponse(payload)
