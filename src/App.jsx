@@ -127,6 +127,7 @@ function PreviousTournaments() {
 export default function PickleballMexicanoManager() {
   const [mode, setMode] = useState('viewer')
   const [password, setPassword] = useState('')
+  const [loginError, setLoginError] = useState('')
 
   const [tournamentName, setTournamentName] = useState('Saturday Mexicano Cup')
   const [playerName, setPlayerName] = useState('')
@@ -148,19 +149,29 @@ export default function PickleballMexicanoManager() {
   useEffect(() => save('pb_history', history), [history])
 
   const login = () => {
-    if (password === '2898') {
+    if (password.trim() === '4321') {
       setMode('admin')
+      setPassword('')
+      setLoginError('')
+      return
     }
+
+    setLoginError('Wrong password')
   }
 
   const addPlayer = () => {
-    if (!playerName.trim()) return
+    const normalizedName = playerName.trim()
+
+    if (!normalizedName) return
+    if (players.some((player) => player.name.toLowerCase() === normalizedName.toLowerCase())) {
+      return
+    }
 
     setPlayers((prev) => [
       ...prev,
       {
         id: crypto.randomUUID(),
-        name: playerName,
+        name: normalizedName,
         points: 0,
         wins: 0,
         rests: 0,
@@ -172,7 +183,12 @@ export default function PickleballMexicanoManager() {
   }
 
   const startNextRound = () => {
+    if (currentRound) return
+    if (players.length < 4 || courts < 1) return
+
     const generated = generateRound(players, courts)
+
+    if (generated.matches.length === 0) return
 
     setPlayers((prev) =>
       prev.map((p) => {
@@ -192,6 +208,8 @@ export default function PickleballMexicanoManager() {
   }
 
   const updateScore = (idx, field, value) => {
+    if (!currentRound) return
+
     setCurrentRound((prev) => {
       const updated = { ...prev }
       updated.matches = [...updated.matches]
@@ -206,6 +224,14 @@ export default function PickleballMexicanoManager() {
   }
 
   const finalizeRound = () => {
+    if (!currentRound) return
+
+    const hasIncompleteScores = currentRound.matches.some((match) => (
+      match.scoreA === '' || match.scoreB === ''
+    ))
+
+    if (hasIncompleteScores) return
+
     let updatedPlayers = [...players]
 
     currentRound.matches.forEach((m) => {
@@ -215,6 +241,7 @@ export default function PickleballMexicanoManager() {
       if (isNaN(a) || isNaN(b)) return
 
       const aWon = a > b
+      const isTie = a === b
 
       const apply = (player, pts, win) => {
         updatedPlayers = updatedPlayers.map((p) => {
@@ -229,8 +256,8 @@ export default function PickleballMexicanoManager() {
         })
       }
 
-      m.teamA.forEach((p) => apply(p, a, aWon))
-      m.teamB.forEach((p) => apply(p, b, !aWon))
+      m.teamA.forEach((p) => apply(p, a, !isTie && aWon))
+      m.teamB.forEach((p) => apply(p, b, !isTie && !aWon))
     })
 
     setPlayers(updatedPlayers)
@@ -247,6 +274,8 @@ export default function PickleballMexicanoManager() {
   }
 
   const finishTournament = () => {
+    if (players.length === 0 || currentRound) return
+
     const completedTournament = {
       id: crypto.randomUUID(),
       name: tournamentName,
@@ -290,22 +319,41 @@ export default function PickleballMexicanoManager() {
           </div>
 
           {!isAdmin && (
-            <div className="flex gap-2">
+            <form
+              className="flex flex-col gap-2 md:items-end"
+              onSubmit={(e) => {
+                e.preventDefault()
+                login()
+              }}
+            >
+              <div className="flex gap-2">
               <input
                 type="password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value)
+                  if (loginError) {
+                    setLoginError('')
+                  }
+                }}
                 placeholder="Admin password"
                 className="border rounded-xl px-4 py-2"
               />
 
               <button
-                onClick={login}
+                type="submit"
                 className="bg-black text-white px-4 py-2 rounded-xl"
               >
                 Login
               </button>
-            </div>
+              </div>
+
+              {loginError && (
+                <div className="text-sm text-red-600">
+                  {loginError}
+                </div>
+              )}
+            </form>
           )}
         </div>
 
@@ -363,8 +411,8 @@ export default function PickleballMexicanoManager() {
 
               <button
                 onClick={startNextRound}
-                disabled={players.length < 4}
-                className="w-full bg-green-600 text-white py-3 rounded-2xl font-semibold"
+                disabled={players.length < 4 || currentRound || courts < 1}
+                className="w-full bg-green-600 disabled:bg-gray-300 disabled:text-gray-500 text-white py-3 rounded-2xl font-semibold"
               >
                 Generate Round {round + 1}
               </button>
@@ -372,7 +420,8 @@ export default function PickleballMexicanoManager() {
               <div className="flex gap-2">
                 <button
                   onClick={finishTournament}
-                  className="flex-1 bg-yellow-500 text-white py-3 rounded-2xl font-semibold"
+                  disabled={players.length === 0 || Boolean(currentRound)}
+                  className="flex-1 bg-yellow-500 disabled:bg-gray-300 disabled:text-gray-500 text-white py-3 rounded-2xl font-semibold"
                 >
                   Finish
                 </button>
@@ -521,7 +570,8 @@ export default function PickleballMexicanoManager() {
             {isAdmin && (
               <button
                 onClick={finalizeRound}
-                className="w-full bg-blue-600 text-white py-4 rounded-2xl font-semibold"
+                disabled={currentRound.matches.some((match) => match.scoreA === '' || match.scoreB === '')}
+                className="w-full bg-blue-600 disabled:bg-gray-300 disabled:text-gray-500 text-white py-4 rounded-2xl font-semibold"
               >
                 Finalize Round
               </button>
