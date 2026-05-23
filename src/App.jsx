@@ -203,6 +203,12 @@ export default function PickleballMexicanoManager() {
   const hasPendingChangesRef = useRef(false)
   const skipNextPushRef = useRef(false)
 
+  const isNewerTimestamp = (nextTimestamp, currentTimestamp) => {
+    if (!nextTimestamp) return false
+    if (!currentTimestamp) return true
+    return nextTimestamp > currentTimestamp
+  }
+
   const isAdmin = mode === 'admin'
 
   const ranking = useMemo(() => sortPlayers(players), [players])
@@ -340,7 +346,7 @@ export default function PickleballMexicanoManager() {
           return
         }
 
-        if (payload.updatedAt !== lastRemoteUpdatedAtRef.current) {
+        if (isNewerTimestamp(payload.updatedAt, lastRemoteUpdatedAtRef.current)) {
           skipNextPushRef.current = true
           applyState(payload.state)
           lastRemoteUpdatedAtRef.current = payload.updatedAt
