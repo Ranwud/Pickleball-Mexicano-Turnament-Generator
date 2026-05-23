@@ -42,7 +42,8 @@ async function readState() {
   } else if (blob.body) {
     data = await new Response(blob.body).text()
   } else if (blob.stream) {
-    data = await new Response(blob.stream()).text()
+    const stream = typeof blob.stream === 'function' ? blob.stream() : blob.stream
+    data = await new Response(stream).text()
   } else {
     throw new Error('Blob payload is missing a readable body')
   }
