@@ -35,7 +35,18 @@ async function readState() {
     }
   }
 
-  const data = await blob.text()
+  let data = null
+
+  if (typeof blob.text === 'function') {
+    data = await blob.text()
+  } else if (blob.body) {
+    data = await new Response(blob.body).text()
+  } else if (blob.stream) {
+    data = await new Response(blob.stream()).text()
+  } else {
+    throw new Error('Blob payload is missing a readable body')
+  }
+
   const parsed = JSON.parse(data)
 
   return {
