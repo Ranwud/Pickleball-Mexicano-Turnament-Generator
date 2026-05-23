@@ -183,6 +183,8 @@ export default function PickleballMexicanoManager() {
 
   const [tournamentName, setTournamentName] = useState(DEFAULT_TOURNAMENT_NAME)
   const [playerName, setPlayerName] = useState('')
+  const [editingPlayerId, setEditingPlayerId] = useState(null)
+  const [editingPlayerName, setEditingPlayerName] = useState('')
   const [courts, setCourts] = useState(3)
 
   const [players, setPlayers] = useState(() => load('pb_players', DEFAULT_STATE.players))
@@ -199,6 +201,7 @@ export default function PickleballMexicanoManager() {
   const [isPublishing, setIsPublishing] = useState(false)
 
   const isAdmin = mode === 'admin'
+  const canEditPlayers = round === 0 && history.length === 0 && !currentRound
 
   const ranking = useMemo(() => sortPlayers(players), [players])
 
@@ -304,6 +307,60 @@ export default function PickleballMexicanoManager() {
     ])
 
     setPlayerName('')
+    setHasUnpublishedChanges(true)
+    setSyncStatus('Draft changes not published')
+  }
+
+  const startEditingPlayer = (player) => {
+    if (!canEditPlayers) return
+
+    setEditingPlayerId(player.id)
+    setEditingPlayerName(player.name)
+  }
+
+  const cancelEditingPlayer = () => {
+    setEditingPlayerId(null)
+    setEditingPlayerName('')
+  }
+
+  const saveEditedPlayer = () => {
+    if (!editingPlayerId || !canEditPlayers) return
+
+    const normalizedName = editingPlayerName.trim()
+
+    if (!normalizedName) return
+    if (
+      players.some(
+        (player) =>
+          player.id !== editingPlayerId &&
+          player.name.toLowerCase() === normalizedName.toLowerCase(),
+      )
+    ) {
+      return
+    }
+
+    setPlayers((prev) =>
+      prev.map((player) =>
+        player.id === editingPlayerId
+          ? { ...player, name: normalizedName }
+          : player,
+      ),
+    )
+
+    cancelEditingPlayer()
+    setHasUnpublishedChanges(true)
+    setSyncStatus('Draft changes not published')
+  }
+
+  const removePlayer = (playerId) => {
+    if (!canEditPlayers) return
+
+    setPlayers((prev) => prev.filter((player) => player.id !== playerId))
+
+    if (editingPlayerId === playerId) {
+      cancelEditingPlayer()
+    }
+
     setHasUnpublishedChanges(true)
     setSyncStatus('Draft changes not published')
   }
@@ -631,20 +688,74 @@ export default function PickleballMexicanoManager() {
                   key={p.id}
                   className="flex justify-between bg-gray-100 rounded-xl px-4 py-3"
                 >
-                  <div>
-                    <div className="font-semibold">
-                      #{idx + 1} {p.name}
-                    </div>
+                  <div className="flex-1 min-w-0">
+                    {isAdmin && canEditPlayers && editingPlayerId === p.id ? (
+                      <div className="flex flex-col gap-2 md:flex-row md:items-center">
+                        <input
+                          value={editingPlayerName}
+                          onChange={(e) => setEditingPlayerName(e.target.value)}
+                          className="border rounded-xl px-3 py-2 flex-1"
+                        />
 
-                    <div className="text-sm text-gray-500">
-                      Wins: {p.wins} · Games: {p.gamesPlayed} · Rests: {p.rests}
-                    </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={saveEditedPlayer}
+                            className="bg-blue-600 text-white px-3 py-2 rounded-xl text-sm"
+                          >
+                            Save
+                          </button>
+
+                          <button
+                            onClick={cancelEditingPlayer}
+                            className="bg-gray-200 text-gray-900 px-3 py-2 rounded-xl text-sm"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="font-semibold">
+                          #{idx + 1} {p.name}
+                        </div>
+
+                        <div className="text-sm text-gray-500">
+                          Wins: {p.wins} · Games: {p.gamesPlayed} · Rests: {p.rests}
+                        </div>
+                      </>
+                    )}
                   </div>
 
-                  <div className="text-xl font-bold">{p.points}</div>
+                  <div className="flex items-center gap-3 ml-4">
+                    <div className="text-xl font-bold">{p.points}</div>
+
+                    {isAdmin && canEditPlayers && editingPlayerId !== p.id && (
+                      <>
+                        <button
+                          onClick={() => startEditingPlayer(p)}
+                          className="bg-white text-gray-900 px-3 py-2 rounded-xl text-sm border"
+                        >
+                          Edit
+                        </button>
+
+                        <button
+                          onClick={() => removePlayer(p.id)}
+                          className="bg-red-500 text-white px-3 py-2 rounded-xl text-sm"
+                        >
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
+
+            {isAdmin && canEditPlayers && players.length > 0 && (
+              <div className="text-sm text-gray-500 mt-4">
+                Players can be edited or removed only before the first round is generated.
+              </div>
+            )}
           </div>
         </div>
 
