@@ -1,4 +1,17 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+
+const SHARED_STATE_URL = '/api/state'
+const SYNC_INTERVAL_MS = 5000
+const DEFAULT_TOURNAMENT_NAME = 'Saturday Mexicano Cup'
+const DEFAULT_STATE = {
+  tournamentName: DEFAULT_TOURNAMENT_NAME,
+  players: [],
+  round: 0,
+  currentRound: null,
+  history: [],
+  finished: false,
+  archivedTournaments: [],
+}
 
 function save(key, value) {
   localStorage.setItem(key, JSON.stringify(value))
@@ -63,8 +76,48 @@ function generateRound(players, courts) {
   return { matches, resting }
 }
 
-function PreviousTournaments() {
-  const tournaments = load('pb_all_tournaments', [])
+function buildLocalState() {
+  return {
+    tournamentName: load('pb_tournament_name', DEFAULT_STATE.tournamentName),
+    players: load('pb_players', DEFAULT_STATE.players),
+    round: load('pb_round', DEFAULT_STATE.round),
+    currentRound: load('pb_current_round', DEFAULT_STATE.currentRound),
+    history: load('pb_history', DEFAULT_STATE.history),
+    finished: load('pb_finished', DEFAULT_STATE.finished),
+    archivedTournaments: load('pb_all_tournaments', DEFAULT_STATE.archivedTournaments),
+  }
+}
+
+async function fetchSharedState() {
+  const response = await fetch(SHARED_STATE_URL, {
+    method: 'GET',
+    cache: 'no-store',
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch shared state: ${response.status}`)
+  }
+
+  return response.json()
+}
+
+async function pushSharedState(state) {
+  const response = await fetch(SHARED_STATE_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ state }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to save shared state: ${response.status}`)
+  }
+
+  return response.json()
+}
+
+function PreviousTournaments({ tournaments }) {
   const [opened, setOpened] = useState(null)
 
   return (
@@ -129,24 +182,182 @@ export default function PickleballMexicanoManager() {
   const [password, setPassword] = useState('')
   const [loginError, setLoginError] = useState('')
 
-  const [tournamentName, setTournamentName] = useState('Saturday Mexicano Cup')
+  const [tournamentName, setTournamentName] = useState(DEFAULT_TOURNAMENT_NAME)
   const [playerName, setPlayerName] = useState('')
   const [courts, setCourts] = useState(3)
 
-  const [players, setPlayers] = useState(() => load('pb_players', []))
-  const [round, setRound] = useState(() => load('pb_round', 0))
-  const [currentRound, setCurrentRound] = useState(() => load('pb_current_round', null))
-  const [history, setHistory] = useState(() => load('pb_history', []))
-  const [finished, setFinished] = useState(false)
+  const [players, setPlayers] = useState(() => load('pb_players', DEFAULT_STATE.players))
+  const [round, setRound] = useState(() => load('pb_round', DEFAULT_STATE.round))
+  const [currentRound, setCurrentRound] = useState(() => load('pb_current_round', DEFAULT_STATE.currentRound))
+  const [history, setHistory] = useState(() => load('pb_history', DEFAULT_STATE.history))
+  const [finished, setFinished] = useState(() => load('pb_finished', DEFAULT_STATE.finished))
+  const [archivedTournaments, setArchivedTournaments] = useState(() => load('pb_all_tournaments', DEFAULT_STATE.archivedTournaments))
+  const [syncReady, setSyncReady] = useState(false)
+  const [syncStatus, setSyncStatus] = useState('Connecting...')
+  const [syncError, setSyncError] = useState('')
+
+  const hasHydratedRef = useRef(false)
+  const lastRemoteUpdatedAtRef = useRef(null)
+  const saveTimerRef = useRef(null)
+  const isPushingRef = useRef(false)
+  const hasPendingChangesRef = useRef(false)
+  const skipNextPushRef = useRef(false)
 
   const isAdmin = mode === 'admin'
 
   const ranking = useMemo(() => sortPlayers(players), [players])
 
+  useEffect(() => save('pb_tournament_name', tournamentName), [tournamentName])
   useEffect(() => save('pb_players', players), [players])
   useEffect(() => save('pb_round', round), [round])
   useEffect(() => save('pb_current_round', currentRound), [currentRound])
   useEffect(() => save('pb_history', history), [history])
+  useEffect(() => save('pb_finished', finished), [finished])
+  useEffect(() => save('pb_all_tournaments', archivedTournaments), [archivedTournaments])
+
+  useEffect(() => {
+    const applyState = (nextState) => {
+      setTournamentName(nextState.tournamentName ?? DEFAULT_STATE.tournamentName)
+      setPlayers(nextState.players ?? DEFAULT_STATE.players)
+      setRound(nextState.round ?? DEFAULT_STATE.round)
+      setCurrentRound(nextState.currentRound ?? DEFAULT_STATE.currentRound)
+      setHistory(nextState.history ?? DEFAULT_STATE.history)
+      setFinished(nextState.finished ?? DEFAULT_STATE.finished)
+      setArchivedTournaments(nextState.archivedTournaments ?? DEFAULT_STATE.archivedTournaments)
+    }
+
+    const hydrate = async () => {
+      const localState = buildLocalState()
+
+      try {
+        const remotePayload = await fetchSharedState()
+        const hasRemoteData = Boolean(remotePayload.updatedAt)
+        const hasLocalData = (
+          localState.players.length > 0 ||
+          localState.history.length > 0 ||
+          localState.round > 0 ||
+          localState.currentRound ||
+          localState.finished ||
+          localState.archivedTournaments.length > 0
+        )
+
+        if (hasRemoteData) {
+          applyState(remotePayload.state)
+          lastRemoteUpdatedAtRef.current = remotePayload.updatedAt
+          setSyncStatus('Synced')
+        } else if (hasLocalData) {
+          applyState(localState)
+          const savedPayload = await pushSharedState(localState)
+          lastRemoteUpdatedAtRef.current = savedPayload.updatedAt
+          setSyncStatus('Synced')
+        } else {
+          applyState(DEFAULT_STATE)
+          setSyncStatus('Ready to sync')
+        }
+
+        setSyncError('')
+      } catch {
+        applyState(localState)
+        setSyncStatus('Local only')
+        setSyncError('Shared sync is unavailable right now')
+      } finally {
+        hasHydratedRef.current = true
+        setSyncReady(true)
+      }
+    }
+
+    hydrate()
+  }, [])
+
+  useEffect(() => {
+    if (!syncReady || !hasHydratedRef.current) return
+    if (skipNextPushRef.current) {
+      skipNextPushRef.current = false
+      return
+    }
+
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+    }
+
+    hasPendingChangesRef.current = true
+    setSyncStatus('Saving...')
+
+    saveTimerRef.current = setTimeout(async () => {
+      isPushingRef.current = true
+
+      try {
+        const payload = await pushSharedState({
+          tournamentName,
+          players,
+          round,
+          currentRound,
+          history,
+          finished,
+          archivedTournaments,
+        })
+        lastRemoteUpdatedAtRef.current = payload.updatedAt
+        hasPendingChangesRef.current = false
+        setSyncStatus('Synced')
+        setSyncError('')
+      } catch {
+        setSyncStatus('Local only')
+        setSyncError('Changes saved only in this browser')
+      } finally {
+        isPushingRef.current = false
+      }
+    }, 800)
+
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current)
+      }
+    }
+  }, [syncReady, tournamentName, players, round, currentRound, history, finished, archivedTournaments])
+
+  useEffect(() => {
+    if (!syncReady || !hasHydratedRef.current) return
+
+    const applyState = (nextState) => {
+      setTournamentName(nextState.tournamentName ?? DEFAULT_STATE.tournamentName)
+      setPlayers(nextState.players ?? DEFAULT_STATE.players)
+      setRound(nextState.round ?? DEFAULT_STATE.round)
+      setCurrentRound(nextState.currentRound ?? DEFAULT_STATE.currentRound)
+      setHistory(nextState.history ?? DEFAULT_STATE.history)
+      setFinished(nextState.finished ?? DEFAULT_STATE.finished)
+      setArchivedTournaments(nextState.archivedTournaments ?? DEFAULT_STATE.archivedTournaments)
+    }
+
+    const intervalId = window.setInterval(async () => {
+      if (isPushingRef.current || hasPendingChangesRef.current) {
+        return
+      }
+
+      try {
+        const payload = await fetchSharedState()
+
+        if (!payload.updatedAt) {
+          return
+        }
+
+        if (payload.updatedAt !== lastRemoteUpdatedAtRef.current) {
+          skipNextPushRef.current = true
+          applyState(payload.state)
+          lastRemoteUpdatedAtRef.current = payload.updatedAt
+        }
+
+        setSyncStatus('Synced')
+        setSyncError('')
+      } catch {
+        setSyncStatus('Local only')
+        setSyncError('Shared sync is unavailable right now')
+      }
+    }, SYNC_INTERVAL_MS)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [syncReady])
 
   const login = () => {
     if (password.trim() === '4321') {
@@ -283,10 +494,7 @@ export default function PickleballMexicanoManager() {
       ranking,
       history,
     }
-
-    const tournaments = load('pb_all_tournaments', [])
-
-    save('pb_all_tournaments', [completedTournament, ...tournaments])
+    setArchivedTournaments((prev) => [completedTournament, ...prev])
 
     setFinished(true)
   }
@@ -297,12 +505,14 @@ export default function PickleballMexicanoManager() {
     setCurrentRound(null)
     setHistory([])
     setFinished(false)
-    setTournamentName('New Mexicano Tournament')
+    setTournamentName(DEFAULT_TOURNAMENT_NAME)
 
+    localStorage.removeItem('pb_tournament_name')
     localStorage.removeItem('pb_players')
     localStorage.removeItem('pb_round')
     localStorage.removeItem('pb_current_round')
     localStorage.removeItem('pb_history')
+    localStorage.removeItem('pb_finished')
   }
 
   return (
@@ -316,6 +526,14 @@ export default function PickleballMexicanoManager() {
             <div className="text-sm text-gray-500">
               Viewer mode is read only.
             </div>
+            <div className="text-sm text-gray-500">
+              Sync: {syncStatus}
+            </div>
+            {syncError && (
+              <div className="text-sm text-amber-600">
+                {syncError}
+              </div>
+            )}
           </div>
 
           {!isAdmin && (
@@ -507,7 +725,7 @@ export default function PickleballMexicanoManager() {
           </div>
         </div>
 
-        <PreviousTournaments />
+        <PreviousTournaments tournaments={archivedTournaments} />
 
         {currentRound && (
           <div className="bg-white rounded-3xl shadow p-6 space-y-6">
