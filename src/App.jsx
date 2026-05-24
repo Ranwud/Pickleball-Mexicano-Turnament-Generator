@@ -1,36 +1,29 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
+// ── Constants ────────────────────────────────────────────────────────────────
 const SHARED_STATE_URL = '/api/state'
 const ADMIN_PASSWORD = '4321'
-const DEFAULT_TOURNAMENT_NAME = 'Saturday Mexicano Cup'
-const DEFAULT_COURTS = 3
-const DEFAULT_STATE = {
-  tournamentName: DEFAULT_TOURNAMENT_NAME,
-  players: [],
-  round: 0,
-  currentRound: null,
-  history: [],
-  finished: false,
-  archivedTournaments: [],
-  completedTournamentSignature: null,
-}
+const DEFAULT_STATE = { tournaments: [] }
 
-function save(key, value) {
-  localStorage.setItem(key, JSON.stringify(value))
-}
+const TOURNAMENT_TYPES = [
+  { value: 'mexicano', label: 'Mexicano' },
+  { value: 'americano', label: 'Americano' },
+]
+const TOURNAMENT_FORMATS = [
+  { value: '2v2', label: '2 на 2' },
+  { value: '1v1', label: '1 на 1' },
+]
 
+// ── Storage ──────────────────────────────────────────────────────────────────
+function save(key, value) { localStorage.setItem(key, JSON.stringify(value)) }
 function load(key, fallback) {
   const raw = localStorage.getItem(key)
   if (!raw) return fallback
-
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return fallback
-  }
+  try { return JSON.parse(raw) } catch { return fallback }
 }
 
+// ── Player helpers ───────────────────────────────────────────────────────────
 function sortPlayers(players) {
   return [...players].sort((a, b) => {
     if (b.points !== a.points) return b.points - a.points
@@ -40,115 +33,195 @@ function sortPlayers(players) {
   })
 }
 
-function normalizePlayerName(name) {
-  return name.trim().replace(/\s+/g, ' ')
+function normalizeName(name) { return name.trim().replace(/\s+/g, ' ') }
+
+function makePlayer(name) {
+  return { id: crypto.randomUUID(), name, points: 0, wins: 0, rests: 0, gamesPlayed: 0 }
 }
 
-function buildTournamentSignature({ tournamentName, history, ranking }) {
-  return JSON.stringify({
-    tournamentName,
-    history: history.map((round) => ({
-      round: round.round,
-      matches: round.matches.map((match) => ({
-        court: match.court,
-        teamA: match.teamA.map((player) => player.id),
-        teamB: match.teamB.map((player) => player.id),
-        scoreA: match.scoreA,
-        scoreB: match.scoreB,
-      })),
-    })),
-    ranking: ranking.map((player) => ({
-      id: player.id,
-      points: player.points,
-      wins: player.wins,
-      rests: player.rests,
-      gamesPlayed: player.gamesPlayed,
-    })),
-  })
-}
+// ── Round generation ─────────────────────────────────────────────────────────
+function pairKey(a, b) { return [a.id, b.id].sort().join('|') }
 
-function generateRound(players, courts) {
-  const sorted = sortPlayers(players)
-  const activeSlots = Math.max(courts, 1) * 4
-  let active = [...sorted]
-  let resting = []
-
-  if (players.length > activeSlots) {
-    const playersToRest = players.length - activeSlots
-
-    resting = [...sorted]
-      .sort((a, b) => {
-        if (a.rests !== b.rests) return a.rests - b.rests
-        if (a.gamesPlayed !== b.gamesPlayed) return a.gamesPlayed - b.gamesPlayed
-        return a.name.localeCompare(b.name)
-      })
-      .slice(0, playersToRest)
-
-    const restingIds = new Set(resting.map((player) => player.id))
-    active = sorted.filter((player) => !restingIds.has(player.id))
+function buildPartnerCounts(history) {
+  const map = new Map()
+  for (const round of history) {
+    for (const match of round.matches) {
+      if (match.teamA.length >= 2) {
+        const k = pairKey(match.teamA[0], match.teamA[1])
+        map.set(k, (map.get(k) ?? 0) + 1)
+      }
+      if (match.teamB.length >= 2) {
+        const k = pairKey(match.teamB[0], match.teamB[1])
+        map.set(k, (map.get(k) ?? 0) + 1)
+      }
+    }
   }
+  return map
+}
+
+function buildOpponentCounts(history) {
+  const map = new Map()
+  for (const round of history) {
+    for (const match of round.matches) {
+      for (const pa of match.teamA) {
+        for (const pb of match.teamB) {
+          const k = pairKey(pa, pb)
+          map.set(k, (map.get(k) ?? 0) + 1)
+        }
+      }
+    }
+  }
+  return map
+}
+
+function bestPairing(group, partnerCounts) {
+  const opts = [
+    { teamA: [group[0], group[3]], teamB: [group[1], group[2]] },
+    { teamA: [group[0], group[2]], teamB: [group[1], group[3]] },
+    { teamA: [group[0], group[1]], teamB: [group[2], group[3]] },
+  ]
+  let best = opts[0]; let bestScore = Infinity
+  for (const opt of opts) {
+    const score =
+      (partnerCounts.get(pairKey(opt.teamA[0], opt.teamA[1])) ?? 0) +
+      (partnerCounts.get(pairKey(opt.teamB[0], opt.teamB[1])) ?? 0)
+    if (score < bestScore) { bestScore = score; best = opt }
+  }
+  return best
+}
+
+function greedySinglesPairs(active, opponentCounts) {
+  const remaining = [...active]; const pairs = []
+  while (remaining.length >= 2) {
+    const a = remaining.shift()
+    let bestIdx = 0; let bestCount = Infinity
+    for (let i = 0; i < remaining.length; i++) {
+      const c = opponentCounts.get(pairKey(a, remaining[i])) ?? 0
+      if (c < bestCount) { bestCount = c; bestIdx = i }
+    }
+    pairs.push([a, remaining[bestIdx]])
+    remaining.splice(bestIdx, 1)
+  }
+  return pairs
+}
+
+function generateRound(tournament) {
+  const { players, courts, type, format, history } = tournament
+  const ppc = format === '1v1' ? 2 : 4
+  const sorted = sortPlayers(players)
+  const maxCourts = Math.min(courts, Math.floor(players.length / ppc))
+  const activeSlots = maxCourts * ppc
+  const toRest = players.length - activeSlots
+
+  let resting = []
+  if (toRest > 0) {
+    resting = [...sorted]
+      .sort((a, b) => a.rests - b.rests || a.gamesPlayed - b.gamesPlayed || a.name.localeCompare(b.name))
+      .slice(0, toRest)
+  }
+  const restIds = new Set(resting.map(p => p.id))
+  const active = sorted.filter(p => !restIds.has(p.id))
 
   const matches = []
 
-  for (let index = 0; index < active.length; index += 4) {
-    const group = active.slice(index, index + 4)
-    if (group.length < 4) continue
-
-    matches.push({
-      court: matches.length + 1,
-      teamA: [group[0], group[3]],
-      teamB: [group[1], group[2]],
-      scoreA: '',
-      scoreB: '',
-    })
+  if (format === '1v1') {
+    const pairs = type === 'mexicano'
+      ? active.reduce((acc, p, i) => { if (i % 2 === 0 && active[i + 1]) acc.push([p, active[i + 1]]); return acc }, [])
+      : greedySinglesPairs(active, buildOpponentCounts(history))
+    pairs.forEach((pair, i) =>
+      matches.push({ court: i + 1, teamA: [pair[0]], teamB: [pair[1]], scoreA: '', scoreB: '' })
+    )
+  } else {
+    const partnerCounts = type === 'americano' ? buildPartnerCounts(history) : null
+    for (let i = 0; i + 3 < active.length; i += 4) {
+      const g = active.slice(i, i + 4)
+      const { teamA, teamB } = type === 'mexicano'
+        ? { teamA: [g[0], g[3]], teamB: [g[1], g[2]] }
+        : bestPairing(g, partnerCounts)
+      matches.push({ court: matches.length + 1, teamA, teamB, scoreA: '', scoreB: '' })
+    }
   }
 
   return { matches, resting }
 }
 
-function buildLocalState() {
-  return {
-    tournamentName: load('pb_tournament_name', DEFAULT_STATE.tournamentName),
-    players: load('pb_players', DEFAULT_STATE.players),
-    round: load('pb_round', DEFAULT_STATE.round),
-    currentRound: load('pb_current_round', DEFAULT_STATE.currentRound),
-    history: load('pb_history', DEFAULT_STATE.history),
-    finished: load('pb_finished', DEFAULT_STATE.finished),
-    archivedTournaments: load('pb_all_tournaments', DEFAULT_STATE.archivedTournaments),
-    completedTournamentSignature: load(
-      'pb_completed_tournament_signature',
-      DEFAULT_STATE.completedTournamentSignature,
-    ),
-  }
-}
-
+// ── API ──────────────────────────────────────────────────────────────────────
 async function fetchSharedState() {
-  const response = await fetch(SHARED_STATE_URL, {
-    method: 'GET',
-    cache: 'no-store',
-  })
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch shared state: ${response.status}`)
-  }
-
-  return response.json()
+  const res = await fetch(SHARED_STATE_URL, { method: 'GET', cache: 'no-store' })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json()
 }
-
 async function pushSharedState(state) {
-  const response = await fetch(SHARED_STATE_URL, {
+  const res = await fetch(SHARED_STATE_URL, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ state }),
   })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json()
+}
 
-  if (!response.ok) {
-    throw new Error(`Failed to save shared state: ${response.status}`)
+// ── Utilities ────────────────────────────────────────────────────────────────
+function computeGlobalLeaderboard(tournaments) {
+  const map = new Map()
+  for (const t of tournaments) {
+    if (t.status !== 'finished') continue
+    for (const p of t.players) {
+      const key = normalizeName(p.name).toLowerCase()
+      const ex = map.get(key) ?? { name: p.name, points: 0, wins: 0, gamesPlayed: 0, tournaments: 0 }
+      map.set(key, {
+        ...ex,
+        points: ex.points + p.points,
+        wins: ex.wins + p.wins,
+        gamesPlayed: ex.gamesPlayed + p.gamesPlayed,
+        tournaments: ex.tournaments + 1,
+      })
+    }
   }
+  return [...map.values()].sort((a, b) =>
+    b.points - a.points || b.wins - a.wins || b.tournaments - a.tournaments
+  )
+}
 
-  return response.json()
+function formatDateTime(iso) {
+  if (!iso) return null
+  return new Date(iso).toLocaleString('ru-RU', {
+    day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit',
+  })
+}
+
+function typeLabel(type, format) {
+  return `${type === 'mexicano' ? 'Mexicano' : 'Americano'} ${format === '2v2' ? '2×2' : '1×1'}`
+}
+
+function migrateOldState(raw) {
+  if (!raw) return []
+  if (Array.isArray(raw.tournaments)) return raw.tournaments
+  // old format: convert archivedTournaments to finished
+  return (raw.archivedTournaments ?? []).map(t => ({
+    id: t.id ?? `t-${Date.now()}-${Math.random()}`,
+    name: t.name ?? 'Турнир',
+    scheduledAt: null,
+    type: 'mexicano',
+    format: '2v2',
+    courts: 2,
+    status: 'finished',
+    players: t.ranking ?? [],
+    round: (t.history ?? []).length,
+    currentRound: null,
+    history: t.history ?? [],
+  }))
+}
+
+// ── UI Primitives ────────────────────────────────────────────────────────────
+function Notification({ notice }) {
+  if (!notice) return null
+  return (
+    <div className={`notice notice--${notice.type}`}>
+      <div className="notice__dot" />
+      <span>{notice.message}</span>
+    </div>
+  )
 }
 
 function SectionCard({ title, subtitle, actions, children, accent = 'default' }) {
@@ -176,64 +249,485 @@ function StatTile({ label, value, hint }) {
   )
 }
 
-function Notification({ notice }) {
-  if (!notice) return null
-
+// ── Pickleball Court Animation ───────────────────────────────────────────────
+function CourtAnimation() {
   return (
-    <div className={`notice notice--${notice.type}`}>
-      <div className="notice__dot" />
-      <div>{notice.message}</div>
+    <div className="court-card">
+      <div className="court-card__glow" />
+      <div className="pb-court">
+        {/* Outer court boundary */}
+        <div className="pb-outer">
+          {/* NVZ (kitchen) zones */}
+          <div className="pb-nvz pb-nvz--left" />
+          <div className="pb-nvz pb-nvz--right" />
+          {/* Center service line */}
+          <div className="pb-service-line" />
+          {/* Net */}
+          <div className="pb-net" />
+          {/* Animated ball */}
+          <div className="pb-ball" />
+        </div>
+        {/* Player markers */}
+        <div className="pb-player pb-player--a1"><span>А1</span></div>
+        <div className="pb-player pb-player--a2"><span>А2</span></div>
+        <div className="pb-player pb-player--b1"><span>Б1</span></div>
+        <div className="pb-player pb-player--b2"><span>Б2</span></div>
+        {/* Team labels */}
+        <div className="pb-team pb-team--a">Команда А</div>
+        <div className="pb-team pb-team--b">Команда Б</div>
+      </div>
     </div>
   )
 }
 
-function PreviousTournaments({
-  tournaments,
-  isAdmin,
-  openedId,
-  onToggle,
-  onDelete,
-}) {
+// ── Tournament Modal ─────────────────────────────────────────────────────────
+function TournamentModal({ initial, onSave, onClose }) {
+  const isEdit = Boolean(initial)
+  const canEditRoster = !isEdit || (initial.round === 0 && !initial.currentRound && initial.history.length === 0)
+
+  const [name, setName] = useState(initial?.name ?? '')
+  const [scheduledAt, setScheduledAt] = useState(
+    initial?.scheduledAt ? new Date(initial.scheduledAt).toISOString().slice(0, 16) : ''
+  )
+  const [type, setType] = useState(initial?.type ?? 'mexicano')
+  const [format, setFormat] = useState(initial?.format ?? '2v2')
+  const [courts, setCourts] = useState(initial?.courts ?? 2)
+  const [players, setPlayers] = useState(initial?.players ?? [])
+  const [newName, setNewName] = useState('')
+  const [editingId, setEditingId] = useState(null)
+  const [editingVal, setEditingVal] = useState('')
+  const [err, setErr] = useState('')
+  const newNameRef = useRef(null)
+
+  function addPlayer() {
+    const n = normalizeName(newName)
+    if (!n) return
+    if (players.some(p => p.name.toLowerCase() === n.toLowerCase())) {
+      setErr('Игрок с таким именем уже есть'); return
+    }
+    setPlayers(prev => [...prev, makePlayer(n)])
+    setNewName(''); setErr('')
+    newNameRef.current?.focus()
+  }
+
+  function saveEdit() {
+    const n = normalizeName(editingVal)
+    if (!n) return
+    if (players.some(p => p.id !== editingId && p.name.toLowerCase() === n.toLowerCase())) {
+      setErr('Имя уже занято'); return
+    }
+    setPlayers(prev => prev.map(p => p.id === editingId ? { ...p, name: n } : p))
+    setEditingId(null); setEditingVal(''); setErr('')
+  }
+
+  function handleSave() {
+    const n = normalizeName(name)
+    if (!n) { setErr('Введите название турнира'); return }
+    const minPlayers = format === '1v1' ? 2 : 4
+    if (players.length > 0 && players.length < minPlayers) {
+      setErr(`Для формата ${format} нужно минимум ${minPlayers} игрока`); return
+    }
+    onSave({
+      ...(initial ?? {}),
+      id: initial?.id ?? `t-${Date.now()}`,
+      name: n,
+      scheduledAt: scheduledAt ? new Date(scheduledAt).toISOString() : null,
+      type,
+      format,
+      courts: Math.max(1, courts),
+      status: initial?.status ?? 'upcoming',
+      players,
+      round: initial?.round ?? 0,
+      currentRound: initial?.currentRound ?? null,
+      history: initial?.history ?? [],
+    })
+  }
+
+  return (
+    <div className="modal-overlay" onMouseDown={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" role="dialog" aria-modal="true">
+        <div className="modal__header">
+          <h2 className="modal__title">{isEdit ? 'Редактировать турнир' : 'Новый турнир'}</h2>
+          <button onClick={onClose} className="modal__close" aria-label="Закрыть">✕</button>
+        </div>
+
+        <div className="modal__body">
+          {err && <div className="field__error modal__err">{err}</div>}
+
+          <label className="field">
+            <span className="field__label">Название турнира</span>
+            <input
+              value={name}
+              onChange={e => { setName(e.target.value); setErr('') }}
+              className="input"
+              placeholder="Субботний Mexicano"
+              autoFocus
+            />
+          </label>
+
+          <label className="field">
+            <span className="field__label">Дата и время</span>
+            <input
+              type="datetime-local"
+              value={scheduledAt}
+              onChange={e => setScheduledAt(e.target.value)}
+              className="input"
+            />
+          </label>
+
+          <div className="modal__row">
+            <label className="field">
+              <span className="field__label">Тип</span>
+              <select value={type} onChange={e => setType(e.target.value)} className="input">
+                {TOURNAMENT_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+              </select>
+            </label>
+            <label className="field">
+              <span className="field__label">Формат</span>
+              <select value={format} onChange={e => setFormat(e.target.value)} className="input">
+                {TOURNAMENT_FORMATS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+              </select>
+            </label>
+            <label className="field field--compact">
+              <span className="field__label">Корты</span>
+              <input
+                type="number" min={1} max={20}
+                value={courts}
+                onChange={e => setCourts(Number(e.target.value))}
+                className="input"
+              />
+            </label>
+          </div>
+
+          <div className="modal__type-hint">
+            {type === 'mexicano'
+              ? 'Mexicano: партнёры меняются каждый раунд на основе текущего рейтинга.'
+              : 'Americano: жеребьёвка минимизирует повторы партнёров, каждый сыграет со всеми.'}
+            {' '}
+            {format === '2v2' ? 'Формат 2×2: команды по два человека.' : 'Формат 1×1: одиночные матчи.'}
+          </div>
+
+          <div className="field">
+            <span className="field__label">
+              Участники ({players.length})
+              {!canEditRoster && <span className="field__locked"> · состав заблокирован после начала</span>}
+            </span>
+            {canEditRoster && (
+              <div className="inline-field">
+                <input
+                  ref={newNameRef}
+                  value={newName}
+                  onChange={e => { setNewName(e.target.value); setErr('') }}
+                  onKeyDown={e => e.key === 'Enter' && addPlayer()}
+                  placeholder="Имя игрока"
+                  className="input"
+                />
+                <button onClick={addPlayer} className="button button--dark">Добавить</button>
+              </div>
+            )}
+          </div>
+
+          <div className="player-list">
+            {players.length === 0 && (
+              <div className="empty-state" style={{ padding: '0.75rem' }}>Участников пока нет.</div>
+            )}
+            {players.map(p => (
+              <div key={p.id} className="player-list__item">
+                {editingId === p.id ? (
+                  <div className="inline-field" style={{ width: '100%' }}>
+                    <input
+                      value={editingVal}
+                      onChange={e => setEditingVal(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') setEditingId(null) }}
+                      className="input"
+                      autoFocus
+                    />
+                    <button onClick={saveEdit} className="button button--primary">OK</button>
+                    <button onClick={() => setEditingId(null)} className="button button--ghost">✕</button>
+                  </div>
+                ) : (
+                  <>
+                    <span className="player-list__name">{p.name}</span>
+                    {canEditRoster && (
+                      <div className="player-list__actions">
+                        <button
+                          onClick={() => { setEditingId(p.id); setEditingVal(p.name) }}
+                          className="button button--ghost button--icon"
+                          title="Переименовать"
+                        >✏</button>
+                        <button
+                          onClick={() => setPlayers(prev => prev.filter(x => x.id !== p.id))}
+                          className="button button--danger-soft button--icon"
+                          title="Удалить"
+                        >✕</button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="modal__footer">
+          <button onClick={onClose} className="button button--ghost">Отмена</button>
+          <button onClick={handleSave} className="button button--primary">
+            {isEdit ? 'Сохранить' : 'Создать турнир'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Global Leaderboard ───────────────────────────────────────────────────────
+function GlobalLeaderboard({ tournaments }) {
+  const leaders = useMemo(() => computeGlobalLeaderboard(tournaments), [tournaments])
+
   return (
     <SectionCard
-      title="Previous Tournaments"
-      subtitle="Published tournament archives stay available for players and can be managed from admin mode."
+      title="Общий рейтинг"
+      subtitle="Топ игроков по всем завершённым турнирам"
+      accent="mint"
+    >
+      <div className="leaderboard">
+        {leaders.length === 0 && (
+          <div className="empty-state">
+            Рейтинг появится после завершения первого турнира.
+          </div>
+        )}
+        {leaders.slice(0, 20).map((p, i) => (
+          <div key={p.name} className="leaderboard__item">
+            <div className={`leaderboard__rank${i < 3 ? ` leaderboard__rank--${['gold','silver','bronze'][i]}` : ''}`}>
+              #{i + 1}
+            </div>
+            <div className="leaderboard__main">
+              <div className="leaderboard__name">{p.name}</div>
+              <div className="leaderboard__meta">
+                Побед {p.wins} · Игр {p.gamesPlayed} · Турниров {p.tournaments}
+              </div>
+            </div>
+            <div className="leaderboard__score">{p.points}</div>
+          </div>
+        ))}
+      </div>
+    </SectionCard>
+  )
+}
+
+// ── Active Tournament Panel ──────────────────────────────────────────────────
+function ActiveTournamentPanel({ tournament, isAdmin, onUpdate, showNotice }) {
+  const { round, currentRound, history, players, format } = tournament
+  const ranking = useMemo(() => sortPlayers(players), [players])
+  const ppc = format === '1v1' ? 2 : 4
+  const canStart = !currentRound && players.length >= ppc
+  const canFinalize = currentRound &&
+    !currentRound.matches.some(m => m.scoreA === '' || m.scoreB === '')
+
+  function update(patch) { onUpdate({ ...tournament, ...patch }) }
+
+  function handleStartRound() {
+    if (!canStart) return
+    const gen = generateRound(tournament)
+    if (!gen.matches.length) { showNotice('Недостаточно игроков для жеребьёвки.', 'warning'); return }
+    update({
+      players: players.map(p =>
+        gen.resting.some(r => r.id === p.id) ? { ...p, rests: p.rests + 1 } : p
+      ),
+      currentRound: gen,
+      round: round + 1,
+    })
+  }
+
+  function updateScore(idx, field, val) {
+    if (!currentRound) return
+    const matches = [...currentRound.matches]
+    matches[idx] = { ...matches[idx], [field]: val }
+    update({ currentRound: { ...currentRound, matches } })
+  }
+
+  function handleFinalize() {
+    if (!canFinalize) return
+    let updated = [...players]
+    currentRound.matches.forEach(m => {
+      const a = parseInt(m.scoreA, 10), b = parseInt(m.scoreB, 10)
+      if (isNaN(a) || isNaN(b)) return
+      const aWon = a > b; const tie = a === b
+      const apply = (p, pts, won) => {
+        updated = updated.map(x =>
+          x.id === p.id
+            ? { ...x, points: x.points + pts, wins: x.wins + (!tie && won ? 1 : 0), gamesPlayed: x.gamesPlayed + 1 }
+            : x
+        )
+      }
+      m.teamA.forEach(p => apply(p, a, aWon))
+      m.teamB.forEach(p => apply(p, b, !aWon))
+    })
+    update({ players: updated, currentRound: null, history: [...history, { round, matches: currentRound.matches }] })
+    showNotice(`Раунд ${round} зафиксирован.`, 'success')
+  }
+
+  function handleFinish() {
+    if (history.length === 0) { showNotice('Нужен хотя бы один завершённый раунд.', 'warning'); return }
+    update({ status: 'finished' })
+    showNotice(`Турнир «${tournament.name}» завершён!`, 'success')
+  }
+
+  return (
+    <>
+      <SectionCard
+        title={`${tournament.name}`}
+        subtitle={`${typeLabel(tournament.type, tournament.format)} · Раундов: ${history.length} · ${players.length} игроков`}
+        accent="mint"
+        actions={isAdmin ? (
+          <div className="section-card__actions">
+            <button
+              onClick={handleStartRound}
+              disabled={!canStart || Boolean(currentRound)}
+              className="button button--success"
+            >
+              Раунд {round + 1}
+            </button>
+            <button
+              onClick={handleFinish}
+              disabled={history.length === 0 || Boolean(currentRound)}
+              className="button button--accent"
+            >
+              Завершить
+            </button>
+          </div>
+        ) : null}
+      >
+        <div className="leaderboard">
+          {ranking.length === 0 && <div className="empty-state">Нет игроков.</div>}
+          {ranking.map((p, i) => (
+            <div key={p.id} className="leaderboard__item">
+              <div className={`leaderboard__rank${i < 3 ? ` leaderboard__rank--${['gold','silver','bronze'][i]}` : ''}`}>
+                #{i + 1}
+              </div>
+              <div className="leaderboard__main">
+                <div className="leaderboard__name">{p.name}</div>
+                <div className="leaderboard__meta">
+                  Побед {p.wins} · Игр {p.gamesPlayed} · Отдыхов {p.rests}
+                </div>
+              </div>
+              <div className="leaderboard__score">{p.points}</div>
+            </div>
+          ))}
+        </div>
+      </SectionCard>
+
+      {currentRound && (
+        <SectionCard
+          title={`Раунд ${round}`}
+          subtitle="Введите счёт всех матчей, затем нажмите «Зафиксировать»."
+          accent="sand"
+          actions={isAdmin ? (
+            <button
+              onClick={handleFinalize}
+              disabled={!canFinalize}
+              className="button button--primary"
+            >
+              Зафиксировать
+            </button>
+          ) : null}
+        >
+          {currentRound.resting.length > 0 && (
+            <div className="rest-banner">
+              Отдыхают: {currentRound.resting.map(p => p.name).join(', ')}
+            </div>
+          )}
+          <div className="round-grid">
+            {currentRound.matches.map((match, idx) => (
+              <div key={idx} className="match-card">
+                <div className="match-card__court">Корт {match.court}</div>
+                <div className="match-card__team">
+                  {match.teamA.map(p => p.name).join(' и ')}
+                </div>
+                <div className="match-card__versus">против</div>
+                <div className="match-card__team">
+                  {match.teamB.map(p => p.name).join(' и ')}
+                </div>
+                {isAdmin ? (
+                  <div className="score-entry">
+                    <input
+                      type="number" min={0}
+                      value={match.scoreA}
+                      onChange={e => updateScore(idx, 'scoreA', e.target.value)}
+                      className="input input--score"
+                    />
+                    <span className="score-entry__dash">—</span>
+                    <input
+                      type="number" min={0}
+                      value={match.scoreB}
+                      onChange={e => updateScore(idx, 'scoreB', e.target.value)}
+                      className="input input--score"
+                    />
+                  </div>
+                ) : (
+                  <div className="score-static">{match.scoreA || 0} — {match.scoreB || 0}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      )}
+    </>
+  )
+}
+
+// ── Previous Tournaments ─────────────────────────────────────────────────────
+function PreviousTournaments({ tournaments, isAdmin, onDelete }) {
+  const finished = useMemo(
+    () => [...tournaments.filter(t => t.status === 'finished')].reverse(),
+    [tournaments]
+  )
+  const [openId, setOpenId] = useState(null)
+  const [tab, setTab] = useState('ranking')
+
+  function toggle(id) {
+    setOpenId(prev => (prev === id ? null : id))
+    setTab('ranking')
+  }
+
+  return (
+    <SectionCard
+      title="Прошедшие турниры"
+      subtitle="Архив завершённых турниров с рейтингом и историей раундов."
       accent="sand"
     >
       <div className="archive-list">
-        {tournaments.length === 0 && (
-          <div className="empty-state">
-            No completed tournaments yet.
-          </div>
+        {finished.length === 0 && (
+          <div className="empty-state">Завершённых турниров пока нет.</div>
         )}
-
-        {tournaments.map((tournament) => {
-          const isOpen = openedId === tournament.id
-
+        {finished.map(t => {
+          const isOpen = openId === t.id
+          const ranking = sortPlayers(t.players)
           return (
-            <article key={tournament.id} className="archive-item">
+            <article key={t.id} className="archive-item">
               <div className="archive-item__top">
                 <div>
-                  <div className="archive-item__title">{tournament.name}</div>
+                  <div className="archive-item__title">{t.name}</div>
                   <div className="archive-item__meta">
-                    {tournament.date}
+                    {t.scheduledAt ? formatDateTime(t.scheduledAt) : 'Дата не указана'}
+                    {' · '}{typeLabel(t.type, t.format)}
+                    {' · '}{t.history.length} раундов
+                    {' · '}{t.players.length} игроков
                   </div>
                 </div>
-
                 <div className="archive-item__buttons">
                   <button
-                    onClick={() => onToggle(isOpen ? null : tournament.id)}
+                    onClick={() => toggle(t.id)}
                     className="button button--ghost"
                   >
-                    {isOpen ? 'Hide' : 'Open'}
+                    {isOpen ? 'Скрыть' : 'Открыть'}
                   </button>
-
                   {isAdmin && (
                     <button
-                      onClick={() => onDelete(tournament.id)}
+                      onClick={() => onDelete(t.id)}
                       className="button button--danger-soft"
                     >
-                      Delete
+                      Удалить
                     </button>
                   )}
                 </div>
@@ -241,14 +735,61 @@ function PreviousTournaments({
 
               {isOpen && (
                 <div className="archive-item__body">
-                  <div className="mini-grid">
-                    {tournament.ranking.map((player, index) => (
-                      <div key={player.id} className="mini-grid__row">
-                        <div>#{index + 1} {player.name}</div>
-                        <div>{player.points} pts</div>
-                      </div>
-                    ))}
+                  <div className="archive-tabs">
+                    <button
+                      className={`archive-tab${tab === 'ranking' ? ' archive-tab--active' : ''}`}
+                      onClick={() => setTab('ranking')}
+                    >
+                      Рейтинг
+                    </button>
+                    <button
+                      className={`archive-tab${tab === 'rounds' ? ' archive-tab--active' : ''}`}
+                      onClick={() => setTab('rounds')}
+                    >
+                      Раунды ({t.history.length})
+                    </button>
                   </div>
+
+                  {tab === 'ranking' && (
+                    <div className="mini-grid">
+                      {ranking.length === 0 && (
+                        <div className="empty-state">Нет данных о игроках.</div>
+                      )}
+                      {ranking.map((p, i) => (
+                        <div key={p.id} className="mini-grid__row">
+                          <div>#{i + 1} {p.name}</div>
+                          <div className="mini-grid__stats">
+                            <span>{p.points} очк.</span>
+                            <span>{p.wins} поб.</span>
+                            <span>{p.gamesPlayed} игр</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {tab === 'rounds' && (
+                    <div className="history-list">
+                      {t.history.length === 0 && (
+                        <div className="empty-state">Нет сыгранных раундов.</div>
+                      )}
+                      {t.history.map(h => (
+                        <div key={h.round} className="history-item">
+                          <div className="history-item__title">Раунд {h.round}</div>
+                          <div className="history-item__matches">
+                            {h.matches.map((m, i) => (
+                              <div key={i} className="history-match">
+                                <span className="history-match__court">Корт {m.court}</span>
+                                <span className="history-match__team">{m.teamA.map(p => p.name).join(' и ')}</span>
+                                <span className="history-match__score">{m.scoreA} — {m.scoreB}</span>
+                                <span className="history-match__team">{m.teamB.map(p => p.name).join(' и ')}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </article>
@@ -259,420 +800,132 @@ function PreviousTournaments({
   )
 }
 
-export default function PickleballMexicanoManager() {
+// ── Main App ─────────────────────────────────────────────────────────────────
+export default function App() {
   const [mode, setMode] = useState('viewer')
   const [password, setPassword] = useState('')
   const [loginError, setLoginError] = useState('')
   const [notice, setNotice] = useState(null)
 
-  const [tournamentName, setTournamentName] = useState(DEFAULT_TOURNAMENT_NAME)
-  const [playerName, setPlayerName] = useState('')
-  const [editingPlayerId, setEditingPlayerId] = useState(null)
-  const [editingPlayerName, setEditingPlayerName] = useState('')
-  const [courts, setCourts] = useState(DEFAULT_COURTS)
-  const [archiveOpenId, setArchiveOpenId] = useState(null)
-
-  const [players, setPlayers] = useState(() => load('pb_players', DEFAULT_STATE.players))
-  const [round, setRound] = useState(() => load('pb_round', DEFAULT_STATE.round))
-  const [currentRound, setCurrentRound] = useState(() => load('pb_current_round', DEFAULT_STATE.currentRound))
-  const [history, setHistory] = useState(() => load('pb_history', DEFAULT_STATE.history))
-  const [finished, setFinished] = useState(() => load('pb_finished', DEFAULT_STATE.finished))
-  const [archivedTournaments, setArchivedTournaments] = useState(() =>
-    load('pb_all_tournaments', DEFAULT_STATE.archivedTournaments),
-  )
-  const [completedTournamentSignature, setCompletedTournamentSignature] = useState(() =>
-    load(
-      'pb_completed_tournament_signature',
-      DEFAULT_STATE.completedTournamentSignature,
-    ),
-  )
-  const [syncStatus, setSyncStatus] = useState('Loading published data...')
+  const [tournaments, setTournaments] = useState(() => load('pb_tournaments', []))
+  const [syncStatus, setSyncStatus] = useState('Загрузка...')
   const [syncError, setSyncError] = useState('')
   const [lastPublishedAt, setLastPublishedAt] = useState(null)
-  const [hasUnpublishedChanges, setHasUnpublishedChanges] = useState(false)
+  const [hasUnpublished, setHasUnpublished] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [isPublishing, setIsPublishing] = useState(false)
-
-  const finishLockRef = useRef(false)
+  const [showCreate, setShowCreate] = useState(false)
+  const [editTarget, setEditTarget] = useState(null)
 
   const isAdmin = mode === 'admin'
-  const canEditPlayers = round === 0 && history.length === 0 && !currentRound && !finished
-  const canModifyTournament = !finished
 
-  const ranking = useMemo(() => sortPlayers(players), [players])
-  const currentTournamentSignature = useMemo(
-    () => buildTournamentSignature({ tournamentName, history, ranking }),
-    [tournamentName, history, ranking],
+  const active = useMemo(() => tournaments.filter(t => t.status === 'active'), [tournaments])
+  const upcoming = useMemo(
+    () => [...tournaments.filter(t => t.status === 'upcoming')].sort((a, b) =>
+      (a.scheduledAt ?? '') < (b.scheduledAt ?? '') ? -1 : 1
+    ),
+    [tournaments]
   )
-  const alreadyArchived = archivedTournaments.some(
-    (tournament) => tournament.signature === currentTournamentSignature,
-  )
-  const canFinishTournament = (
-    canModifyTournament &&
-    players.length > 0 &&
-    history.length > 0 &&
-    !currentRound &&
-    !alreadyArchived &&
-    completedTournamentSignature !== currentTournamentSignature
+  const finishedCount = useMemo(() => tournaments.filter(t => t.status === 'finished').length, [tournaments])
+
+  const totalPlayers = useMemo(() => {
+    const names = new Set()
+    tournaments.forEach(t => t.players.forEach(p => names.add(normalizeName(p.name).toLowerCase())))
+    return names.size
+  }, [tournaments])
+  const totalMatches = useMemo(
+    () => tournaments.reduce((s, t) => s + t.history.reduce((a, r) => a + r.matches.length, 0), 0),
+    [tournaments]
   )
 
+  useEffect(() => save('pb_tournaments', tournaments), [tournaments])
   useEffect(() => {
-    if (!notice) return undefined
-
-    const timeoutId = window.setTimeout(() => {
-      setNotice(null)
-    }, 2800)
-
-    return () => window.clearTimeout(timeoutId)
+    if (!notice) return
+    const id = window.setTimeout(() => setNotice(null), 3200)
+    return () => window.clearTimeout(id)
   }, [notice])
+  useEffect(() => { void loadPublished() }, [])
 
-  useEffect(() => save('pb_tournament_name', tournamentName), [tournamentName])
-  useEffect(() => save('pb_players', players), [players])
-  useEffect(() => save('pb_round', round), [round])
-  useEffect(() => save('pb_current_round', currentRound), [currentRound])
-  useEffect(() => save('pb_history', history), [history])
-  useEffect(() => save('pb_finished', finished), [finished])
-  useEffect(() => save('pb_all_tournaments', archivedTournaments), [archivedTournaments])
-  useEffect(
-    () => save('pb_completed_tournament_signature', completedTournamentSignature),
-    [completedTournamentSignature],
-  )
+  function showNotice(msg, type = 'info') { setNotice({ message: msg, type }) }
+  function markChanged() { setHasUnpublished(true); setSyncStatus('Есть неопубликованные изменения') }
 
-  useEffect(() => {
-    void loadPublishedState()
-  }, [])
-
-  function showNotice(message, type = 'info') {
-    setNotice({ message, type })
-  }
-
-  function applyState(nextState) {
-    setTournamentName(nextState.tournamentName ?? DEFAULT_STATE.tournamentName)
-    setPlayers(nextState.players ?? DEFAULT_STATE.players)
-    setRound(nextState.round ?? DEFAULT_STATE.round)
-    setCurrentRound(nextState.currentRound ?? DEFAULT_STATE.currentRound)
-    setHistory(nextState.history ?? DEFAULT_STATE.history)
-    setFinished(nextState.finished ?? DEFAULT_STATE.finished)
-    setArchivedTournaments(nextState.archivedTournaments ?? DEFAULT_STATE.archivedTournaments)
-    setCompletedTournamentSignature(
-      nextState.completedTournamentSignature ?? DEFAULT_STATE.completedTournamentSignature,
-    )
-    setEditingPlayerId(null)
-    setEditingPlayerName('')
-  }
-
-  function markDraftChanged(message = null) {
-    setHasUnpublishedChanges(true)
-    setSyncStatus('Draft has unpublished changes')
-    if (message) showNotice(message, 'info')
-  }
-
-  async function loadPublishedState() {
-    const localState = buildLocalState()
+  async function loadPublished() {
     setIsRefreshing(true)
-
     try {
-      const remotePayload = await fetchSharedState()
-      applyState(remotePayload.state ?? DEFAULT_STATE)
-      setLastPublishedAt(remotePayload.updatedAt ?? null)
-      setHasUnpublishedChanges(false)
-      setSyncStatus(remotePayload.updatedAt ? 'Published state loaded' : 'No published state yet')
+      const payload = await fetchSharedState()
+      const next = migrateOldState(payload.state)
+      setTournaments(next)
+      setLastPublishedAt(payload.updatedAt ?? null)
+      setHasUnpublished(false)
+      setSyncStatus(payload.updatedAt ? 'Данные загружены' : 'Нет опубликованных данных')
       setSyncError('')
-      showNotice('Published tournament loaded.', 'success')
+      showNotice('Данные турнира загружены.', 'success')
     } catch {
-      applyState(localState)
-      setHasUnpublishedChanges(true)
-      setSyncStatus('Using browser draft only')
-      setSyncError('Published data is unavailable right now')
-      showNotice('Published data is unavailable. Using local draft.', 'warning')
+      setSyncStatus('Работаем локально')
+      setSyncError('Нет связи с сервером. Используются локальные данные.')
+      showNotice('Нет связи с сервером.', 'warning')
     } finally {
       setIsRefreshing(false)
     }
   }
 
-  async function publishCurrentState(nextStateOverride) {
-    const stateToPublish = nextStateOverride ?? {
-      tournamentName,
-      players,
-      round,
-      currentRound,
-      history,
-      finished,
-      archivedTournaments,
-      completedTournamentSignature,
-    }
-
+  async function publish(next = tournaments) {
     setIsPublishing(true)
-
     try {
-      const payload = await pushSharedState(stateToPublish)
+      const payload = await pushSharedState({ tournaments: next })
       setLastPublishedAt(payload.updatedAt ?? null)
-      setHasUnpublishedChanges(false)
-      setSyncStatus('Published for viewers')
+      setHasUnpublished(false)
+      setSyncStatus('Опубликовано')
       setSyncError('')
-      showNotice('Changes published for viewers.', 'success')
+      showNotice('Изменения опубликованы.', 'success')
     } catch {
-      setSyncStatus('Draft changes not published')
-      setSyncError('Publish failed. Changes are only in this browser until publish succeeds.')
-      showNotice('Publish failed. Draft is still local.', 'error')
+      setSyncStatus('Не опубликовано')
+      setSyncError('Ошибка публикации. Данные сохранены локально.')
+      showNotice('Ошибка публикации.', 'error')
     } finally {
       setIsPublishing(false)
     }
   }
 
+  function patchTournament(updated) {
+    setTournaments(prev => prev.map(t => t.id === updated.id ? updated : t))
+    markChanged()
+  }
+
+  function deleteTournament(id) {
+    setTournaments(prev => prev.filter(t => t.id !== id))
+    markChanged()
+  }
+
+  function handleCreate(t) {
+    setTournaments(prev => [...prev, t])
+    setShowCreate(false)
+    markChanged()
+    showNotice(`Турнир «${t.name}» создан.`, 'success')
+  }
+
+  function handleSaveEdit(t) {
+    patchTournament(t)
+    setEditTarget(null)
+    showNotice(`Турнир «${t.name}» обновлён.`, 'success')
+  }
+
+  function startTournament(id) {
+    setTournaments(prev => prev.map(t => t.id === id ? { ...t, status: 'active' } : t))
+    markChanged()
+    showNotice('Турнир начат!', 'success')
+  }
+
   function login() {
     if (password.trim() === ADMIN_PASSWORD) {
-      setMode('admin')
-      setPassword('')
-      setLoginError('')
-      showNotice('Admin mode enabled.', 'success')
+      setMode('admin'); setPassword(''); setLoginError('')
+      showNotice('Режим администратора включён.', 'success')
       return
     }
-
-    setLoginError('Wrong password')
+    setLoginError('Неверный пароль')
   }
 
-  function addPlayer() {
-    if (!canModifyTournament) return
-
-    const normalizedName = normalizePlayerName(playerName)
-    if (!normalizedName) return
-
-    if (players.some((player) => player.name.toLowerCase() === normalizedName.toLowerCase())) {
-      showNotice('Player names must be unique.', 'warning')
-      return
-    }
-
-    setPlayers((prev) => [
-      ...prev,
-      {
-        id: crypto.randomUUID(),
-        name: normalizedName,
-        points: 0,
-        wins: 0,
-        rests: 0,
-        gamesPlayed: 0,
-      },
-    ])
-    setPlayerName('')
-    markDraftChanged(`Added ${normalizedName}.`)
-  }
-
-  function startEditingPlayer(player) {
-    if (!canEditPlayers) return
-
-    setEditingPlayerId(player.id)
-    setEditingPlayerName(player.name)
-  }
-
-  function cancelEditingPlayer() {
-    setEditingPlayerId(null)
-    setEditingPlayerName('')
-  }
-
-  function saveEditedPlayer() {
-    if (!editingPlayerId || !canEditPlayers) return
-
-    const normalizedName = normalizePlayerName(editingPlayerName)
-    if (!normalizedName) return
-
-    if (
-      players.some(
-        (player) =>
-          player.id !== editingPlayerId &&
-          player.name.toLowerCase() === normalizedName.toLowerCase(),
-      )
-    ) {
-      showNotice('Player names must be unique.', 'warning')
-      return
-    }
-
-    setPlayers((prev) =>
-      prev.map((player) =>
-        player.id === editingPlayerId ? { ...player, name: normalizedName } : player,
-      ),
-    )
-    cancelEditingPlayer()
-    markDraftChanged(`Updated player to ${normalizedName}.`)
-  }
-
-  function removePlayer(playerId) {
-    if (!canEditPlayers) return
-
-    const player = players.find((item) => item.id === playerId)
-    setPlayers((prev) => prev.filter((item) => item.id !== playerId))
-
-    if (editingPlayerId === playerId) {
-      cancelEditingPlayer()
-    }
-
-    markDraftChanged(`Removed ${player?.name ?? 'player'}.`)
-  }
-
-  function startNextRound() {
-    if (!canModifyTournament) return
-    if (currentRound) return
-    if (players.length < 4 || courts < 1) return
-
-    const generated = generateRound(players, courts)
-    if (generated.matches.length === 0) {
-      showNotice('Not enough players for the selected courts.', 'warning')
-      return
-    }
-
-    setPlayers((prev) =>
-      prev.map((player) => (
-        generated.resting.some((restingPlayer) => restingPlayer.id === player.id)
-          ? { ...player, rests: player.rests + 1 }
-          : player
-      )),
-    )
-    setCurrentRound(generated)
-    setRound((prev) => prev + 1)
-    markDraftChanged(`Round ${round + 1} generated.`)
-  }
-
-  function updateScore(matchIndex, field, value) {
-    if (!canModifyTournament || !currentRound) return
-
-    setCurrentRound((prev) => {
-      const updated = { ...prev }
-      updated.matches = [...updated.matches]
-      updated.matches[matchIndex] = {
-        ...updated.matches[matchIndex],
-        [field]: value,
-      }
-      return updated
-    })
-
-    setHasUnpublishedChanges(true)
-    setSyncStatus('Draft has unpublished changes')
-  }
-
-  function finalizeRound() {
-    if (!canModifyTournament || !currentRound) return
-
-    const hasIncompleteScores = currentRound.matches.some(
-      (match) => match.scoreA === '' || match.scoreB === '',
-    )
-    if (hasIncompleteScores) {
-      showNotice('Enter every score before finalizing the round.', 'warning')
-      return
-    }
-
-    let updatedPlayers = [...players]
-
-    currentRound.matches.forEach((match) => {
-      const scoreA = parseInt(match.scoreA, 10)
-      const scoreB = parseInt(match.scoreB, 10)
-      if (Number.isNaN(scoreA) || Number.isNaN(scoreB)) return
-
-      const aWon = scoreA > scoreB
-      const isTie = scoreA === scoreB
-
-      const applyResult = (player, points, won) => {
-        updatedPlayers = updatedPlayers.map((currentPlayer) => (
-          currentPlayer.id === player.id
-            ? {
-                ...currentPlayer,
-                points: currentPlayer.points + points,
-                wins: currentPlayer.wins + (won ? 1 : 0),
-                gamesPlayed: currentPlayer.gamesPlayed + 1,
-              }
-            : currentPlayer
-        ))
-      }
-
-      match.teamA.forEach((player) => applyResult(player, scoreA, !isTie && aWon))
-      match.teamB.forEach((player) => applyResult(player, scoreB, !isTie && !aWon))
-    })
-
-    setPlayers(updatedPlayers)
-    setHistory((prev) => [
-      ...prev,
-      {
-        round,
-        matches: currentRound.matches,
-      },
-    ])
-    setCurrentRound(null)
-    markDraftChanged(`Round ${round} finalized.`)
-  }
-
-  function finishTournament() {
-    if (!canFinishTournament || finishLockRef.current) return
-
-    finishLockRef.current = true
-
-    try {
-      if (alreadyArchived || completedTournamentSignature === currentTournamentSignature) {
-        setFinished(true)
-        showNotice('This tournament was already finished.', 'warning')
-        return
-      }
-
-      const completedTournament = {
-        id: `tournament-${Date.now()}`,
-        signature: currentTournamentSignature,
-        name: tournamentName,
-        date: new Date().toLocaleString(),
-        ranking,
-        history,
-      }
-
-      setArchivedTournaments((prev) => [completedTournament, ...prev])
-      setCompletedTournamentSignature(currentTournamentSignature)
-      setFinished(true)
-      setArchiveOpenId(completedTournament.id)
-      setHasUnpublishedChanges(true)
-      setSyncStatus('Draft has unpublished changes')
-      showNotice('Tournament finished. Publish to share the final standings.', 'success')
-    } finally {
-      window.setTimeout(() => {
-        finishLockRef.current = false
-      }, 250)
-    }
-  }
-
-  function deleteArchivedTournament(tournamentId) {
-    const tournament = archivedTournaments.find((item) => item.id === tournamentId)
-    setArchivedTournaments((prev) => prev.filter((item) => item.id !== tournamentId))
-    if (archiveOpenId === tournamentId) {
-      setArchiveOpenId(null)
-    }
-    if (tournament?.signature === completedTournamentSignature) {
-      setCompletedTournamentSignature(null)
-      setFinished(false)
-    }
-    markDraftChanged(`Deleted archive "${tournament?.name ?? 'tournament'}".`)
-  }
-
-  function resetTournament() {
-    setPlayers([])
-    setRound(0)
-    setCurrentRound(null)
-    setHistory([])
-    setFinished(false)
-    setTournamentName(DEFAULT_TOURNAMENT_NAME)
-    setCompletedTournamentSignature(null)
-    setEditingPlayerId(null)
-    setEditingPlayerName('')
-    setPlayerName('')
-    setCourts(DEFAULT_COURTS)
-
-    localStorage.removeItem('pb_tournament_name')
-    localStorage.removeItem('pb_players')
-    localStorage.removeItem('pb_round')
-    localStorage.removeItem('pb_current_round')
-    localStorage.removeItem('pb_history')
-    localStorage.removeItem('pb_finished')
-    localStorage.removeItem('pb_completed_tournament_signature')
-
-    markDraftChanged('Tournament reset. Publish if viewers should see the reset state.')
-  }
-
-  const roundsPlayed = history.length
-  const totalMatches = history.reduce((sum, item) => sum + item.matches.length, 0)
+  const nextUpcoming = upcoming[0]
 
   return (
     <div className="page-shell">
@@ -682,388 +935,253 @@ export default function PickleballMexicanoManager() {
       <main className="app-frame">
         <Notification notice={notice} />
 
+        {/* ── Hero ── */}
         <section className="hero-panel">
           <div className="hero-panel__copy">
-            <div className="eyebrow">
-              Pickleball Mexicano Tournament
-            </div>
-            <h1 className="hero-panel__title">
-              Fast admin controls, clean viewer mode, and publish-on-demand sharing.
-            </h1>
+            <div className="eyebrow">Пиклбол · Турнирный менеджер</div>
+            <h1 className="hero-panel__title">Управляй турниром, следи за счётом.</h1>
             <p className="hero-panel__text">
-              Manage one live tournament draft, publish when ready, and keep an archive of completed events without creating duplicates.
+              Создавай турниры в форматах Mexicano и Americano — 2×2 или 1×1.
+              Автоматическая жеребьёвка, честный рейтинг и архив всех игр.
             </p>
-
             <div className="hero-panel__badges">
               <span className={`status-pill ${isAdmin ? 'status-pill--success' : 'status-pill--neutral'}`}>
-                {isAdmin ? 'Admin mode' : 'Viewer mode'}
+                {isAdmin ? 'Администратор' : 'Просмотр'}
               </span>
-              <span className="status-pill status-pill--neutral">
-                {syncStatus}
-              </span>
-              {hasUnpublishedChanges && (
-                <span className="status-pill status-pill--warning">
-                  Draft has unpublished changes
-                </span>
+              <span className="status-pill status-pill--neutral">{syncStatus}</span>
+              {hasUnpublished && (
+                <span className="status-pill status-pill--warning">Есть изменения</span>
               )}
             </div>
-
             <div className="hero-panel__meta">
-              <div>Last published: {lastPublishedAt ? new Date(lastPublishedAt).toLocaleString() : 'Not published yet'}</div>
+              <div>Последняя публикация: {lastPublishedAt ? formatDateTime(lastPublishedAt) : 'не опубликовано'}</div>
               {syncError && <div className="hero-panel__warning">{syncError}</div>}
             </div>
           </div>
-
           <div className="hero-panel__visual">
-            <div className="court-card">
-              <div className="court-card__glow" />
-              <div className="court-card__court">
-                <div className="court-card__net" />
-                <div className="court-card__ball court-card__ball--one" />
-                <div className="court-card__ball court-card__ball--two" />
-              </div>
-            </div>
+            <CourtAnimation />
           </div>
         </section>
 
+        {/* ── Stats ── */}
         <section className="stats-row">
-          <StatTile label="Players" value={players.length} hint={canEditPlayers ? 'Roster still editable' : 'Roster locked'} />
-          <StatTile label="Rounds Played" value={roundsPlayed} hint={currentRound ? `Round ${round} in progress` : 'No active round'} />
-          <StatTile label="Matches Logged" value={totalMatches} hint={`${archivedTournaments.length} archived tournaments`} />
-          <StatTile label="Courts" value={courts} hint={finished ? 'Tournament finished' : 'Draft setup'} />
+          <StatTile
+            label="Игроков всего"
+            value={totalPlayers}
+            hint={`${tournaments.length} ${tournaments.length === 1 ? 'турнир' : 'турниров'}`}
+          />
+          <StatTile
+            label="Активных"
+            value={active.length}
+            hint={active[0]?.name ?? 'нет активных'}
+          />
+          <StatTile
+            label="Предстоящих"
+            value={upcoming.length}
+            hint={nextUpcoming ? (formatDateTime(nextUpcoming.scheduledAt) ?? 'дата не указана') : '—'}
+          />
+          <StatTile
+            label="Матчей сыграно"
+            value={totalMatches}
+            hint={`${finishedCount} завершённых`}
+          />
         </section>
 
         <div className="workspace-grid">
           <div className="workspace-grid__main">
+
+            {/* ── Control bar ── */}
             <SectionCard
-              title="Tournament Control"
-              subtitle="Edit the draft, then publish once the viewer-facing state is ready."
+              title="Управление"
+              subtitle="Публикуй изменения, чтобы зрители видели актуальные данные."
               accent="mint"
               actions={!isAdmin ? (
                 <button
-                  onClick={() => void loadPublishedState()}
+                  onClick={() => void loadPublished()}
                   disabled={isRefreshing}
                   className="button button--ghost"
                 >
-                  {isRefreshing ? 'Refreshing...' : 'Refresh'}
+                  {isRefreshing ? 'Загрузка...' : 'Обновить'}
                 </button>
               ) : null}
             >
-              <div className="toolbar">
-                <label className="field field--wide">
-                  <span className="field__label">Tournament name</span>
-                  <input
-                    value={tournamentName}
-                    onChange={(event) => {
-                      if (!canModifyTournament) return
-                      setTournamentName(event.target.value)
-                      markDraftChanged()
-                    }}
-                    className="input"
-                    disabled={!isAdmin || !canModifyTournament}
-                  />
-                </label>
-
-                {isAdmin ? (
-                  <div className="toolbar__buttons">
-                    <button
-                      onClick={() => void publishCurrentState()}
-                      disabled={isPublishing || !hasUnpublishedChanges}
-                      className="button button--primary"
-                    >
-                      {isPublishing ? 'Publishing...' : 'Publish To Viewers'}
-                    </button>
-                    <button
-                      onClick={() => void loadPublishedState()}
-                      disabled={isRefreshing}
-                      className="button button--ghost"
-                    >
-                      {isRefreshing ? 'Refreshing...' : 'Reload Published'}
-                    </button>
-                  </div>
-                ) : (
-                  <form
-                    className="viewer-login"
-                    onSubmit={(event) => {
-                      event.preventDefault()
-                      login()
-                    }}
-                  >
-                    <input
-                      type="password"
-                      value={password}
-                      onChange={(event) => {
-                        setPassword(event.target.value)
-                        if (loginError) setLoginError('')
-                      }}
-                      placeholder="Admin password"
-                      className="input"
-                    />
-                    <button type="submit" className="button button--dark">
-                      Login
-                    </button>
-                    {loginError && <div className="field__error">{loginError}</div>}
-                  </form>
-                )}
-              </div>
-            </SectionCard>
-
-            {isAdmin && (
-              <SectionCard
-                title="Admin Bench"
-                subtitle={canEditPlayers ? 'Build the roster, tune court count, then start round one.' : 'The roster is locked once play begins.'}
-                accent="sand"
-              >
-                <div className="admin-grid">
-                  <div className="admin-grid__panel">
-                    <label className="field">
-                      <span className="field__label">Add player</span>
-                      <div className="inline-field">
-                        <input
-                          value={playerName}
-                          onChange={(event) => setPlayerName(event.target.value)}
-                          placeholder="Player name"
-                          className="input"
-                          disabled={!canModifyTournament}
-                        />
-                        <button
-                          onClick={addPlayer}
-                          className="button button--dark"
-                          disabled={!canModifyTournament}
-                        >
-                          Add
-                        </button>
-                      </div>
-                    </label>
-
-                    <label className="field field--compact">
-                      <span className="field__label">Courts</span>
-                      <input
-                        type="number"
-                        min={1}
-                        value={courts}
-                        onChange={(event) => {
-                          if (!canModifyTournament) return
-                          setCourts(Number(event.target.value))
-                          markDraftChanged()
-                        }}
-                        className="input"
-                        disabled={!canModifyTournament}
-                      />
-                    </label>
-                  </div>
-
-                  <div className="admin-grid__panel admin-grid__panel--actions">
-                    <button
-                      onClick={startNextRound}
-                      disabled={!canModifyTournament || players.length < 4 || Boolean(currentRound) || courts < 1}
-                      className="button button--success button--wide"
-                    >
-                      Generate Round {round + 1}
-                    </button>
-
-                    <button
-                      onClick={finishTournament}
-                      disabled={!canFinishTournament}
-                      className="button button--accent button--wide"
-                    >
-                      {finished ? 'Tournament Finished' : 'Finish Tournament'}
-                    </button>
-
-                    <button
-                      onClick={resetTournament}
-                      className="button button--danger-soft button--wide"
-                    >
-                      Reset Current Tournament
-                    </button>
-                  </div>
-                </div>
-              </SectionCard>
-            )}
-
-            <SectionCard
-              title="Leaderboard"
-              subtitle="Viewers see the latest published standings after a page refresh. Admin edits stay in draft until published."
-              accent="default"
-            >
-              <div className="leaderboard">
-                {ranking.length === 0 && (
-                  <div className="empty-state">
-                    No players yet. Add players in admin mode to start building the bracket.
-                  </div>
-                )}
-
-                {ranking.map((player, index) => (
-                  <div key={player.id} className="leaderboard__item">
-                    <div className="leaderboard__rank">#{index + 1}</div>
-
-                    <div className="leaderboard__main">
-                      {isAdmin && canEditPlayers && editingPlayerId === player.id ? (
-                        <div className="inline-field">
-                          <input
-                            value={editingPlayerName}
-                            onChange={(event) => setEditingPlayerName(event.target.value)}
-                            className="input"
-                          />
-                          <button onClick={saveEditedPlayer} className="button button--primary">
-                            Save
-                          </button>
-                          <button onClick={cancelEditingPlayer} className="button button--ghost">
-                            Cancel
-                          </button>
-                        </div>
-                      ) : (
-                        <>
-                          <div className="leaderboard__name">{player.name}</div>
-                          <div className="leaderboard__meta">
-                            Wins {player.wins} · Games {player.gamesPlayed} · Rests {player.rests}
-                          </div>
-                        </>
-                      )}
-                    </div>
-
-                    <div className="leaderboard__score">{player.points}</div>
-
-                    {isAdmin && canEditPlayers && editingPlayerId !== player.id && (
-                      <div className="leaderboard__actions">
-                        <button onClick={() => startEditingPlayer(player)} className="button button--ghost">
-                          Edit
-                        </button>
-                        <button onClick={() => removePlayer(player.id)} className="button button--danger-soft">
-                          Delete
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </SectionCard>
-
-            {currentRound && (
-              <SectionCard
-                title={`Round ${round}`}
-                subtitle="Enter all scores, then finalize the round to update standings."
-                accent="mint"
-                actions={isAdmin ? (
+              {isAdmin ? (
+                <div className="toolbar__buttons">
+                  <button onClick={() => setShowCreate(true)} className="button button--dark">
+                    + Создать турнир
+                  </button>
                   <button
-                    onClick={finalizeRound}
-                    disabled={currentRound.matches.some(
-                      (match) => match.scoreA === '' || match.scoreB === '',
-                    )}
+                    onClick={() => void publish()}
+                    disabled={isPublishing || !hasUnpublished}
                     className="button button--primary"
                   >
-                    Finalize Round
+                    {isPublishing ? 'Публикация...' : 'Опубликовать'}
                   </button>
-                ) : null}
+                  <button
+                    onClick={() => void loadPublished()}
+                    disabled={isRefreshing}
+                    className="button button--ghost"
+                  >
+                    {isRefreshing ? 'Загрузка...' : 'Перезагрузить'}
+                  </button>
+                </div>
+              ) : (
+                <form className="viewer-login" onSubmit={e => { e.preventDefault(); login() }}>
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={e => { setPassword(e.target.value); if (loginError) setLoginError('') }}
+                    placeholder="Пароль администратора"
+                    className="input"
+                  />
+                  <button type="submit" className="button button--dark">Войти</button>
+                  {loginError && <div className="field__error">{loginError}</div>}
+                </form>
+              )}
+            </SectionCard>
+
+            {/* ── Upcoming ── */}
+            {(upcoming.length > 0 || isAdmin) && (
+              <SectionCard
+                title="Предстоящие турниры"
+                subtitle="Запланированные турниры, которые ещё не начались."
+                accent="sand"
               >
-                {currentRound.resting.length > 0 && (
-                  <div className="rest-banner">
-                    Resting: {currentRound.resting.map((player) => player.name).join(', ')}
-                  </div>
-                )}
-
-                <div className="round-grid">
-                  {currentRound.matches.map((match, index) => (
-                    <div key={index} className="match-card">
-                      <div className="match-card__court">Court {match.court}</div>
-                      <div className="match-card__team">{match.teamA.map((player) => player.name).join(' & ')}</div>
-                      <div className="match-card__versus">vs</div>
-                      <div className="match-card__team">{match.teamB.map((player) => player.name).join(' & ')}</div>
-
-                      {isAdmin ? (
-                        <div className="score-entry">
-                          <input
-                            type="number"
-                            value={match.scoreA}
-                            onChange={(event) => updateScore(index, 'scoreA', event.target.value)}
-                            className="input input--score"
-                            disabled={!canModifyTournament}
-                          />
-                          <span className="score-entry__dash">-</span>
-                          <input
-                            type="number"
-                            value={match.scoreB}
-                            onChange={(event) => updateScore(index, 'scoreB', event.target.value)}
-                            className="input input--score"
-                            disabled={!canModifyTournament}
-                          />
-                        </div>
-                      ) : (
-                        <div className="score-static">
-                          {(match.scoreA || 0)} - {(match.scoreB || 0)}
-                        </div>
-                      )}
+                <div className="archive-list">
+                  {upcoming.length === 0 && (
+                    <div className="empty-state">
+                      Предстоящих турниров нет. Создайте новый кнопкой выше.
                     </div>
+                  )}
+                  {upcoming.map(t => (
+                    <article key={t.id} className="archive-item">
+                      <div className="archive-item__top">
+                        <div>
+                          <div className="archive-item__title">{t.name}</div>
+                          <div className="archive-item__meta">
+                            {t.scheduledAt ? formatDateTime(t.scheduledAt) : 'Дата не указана'}
+                            {' · '}{typeLabel(t.type, t.format)}
+                            {' · '}{t.players.length} игроков
+                          </div>
+                        </div>
+                        {isAdmin && (
+                          <div className="archive-item__buttons">
+                            <button
+                              onClick={() => startTournament(t.id)}
+                              className="button button--success"
+                              disabled={t.players.length < (t.format === '1v1' ? 2 : 4)}
+                            >
+                              Начать
+                            </button>
+                            <button
+                              onClick={() => setEditTarget(t)}
+                              className="button button--ghost"
+                            >
+                              Изменить
+                            </button>
+                            <button
+                              onClick={() => deleteTournament(t.id)}
+                              className="button button--danger-soft"
+                            >
+                              Удалить
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </article>
                   ))}
                 </div>
               </SectionCard>
             )}
 
-            <SectionCard
-              title="Current Tournament History"
-              subtitle="Published history is what viewers will see after refresh. The current draft may contain newer changes."
-              accent="default"
-            >
-              <div className="history-list">
-                {history.length === 0 && (
-                  <div className="empty-state">
-                    No rounds have been finalized yet.
-                  </div>
-                )}
+            {/* ── Active tournaments ── */}
+            {active.map(t => (
+              <ActiveTournamentPanel
+                key={t.id}
+                tournament={t}
+                isAdmin={isAdmin}
+                onUpdate={patchTournament}
+                showNotice={showNotice}
+              />
+            ))}
 
-                {history.map((item) => (
-                  <div key={item.round} className="history-item">
-                    <div className="history-item__title">Round {item.round}</div>
-                    <div className="history-item__matches">
-                      {item.matches.map((match, index) => (
-                        <div key={index}>
-                          Court {match.court}: {match.teamA.map((player) => player.name).join(' & ')} ({match.scoreA}) vs {match.teamB.map((player) => player.name).join(' & ')} ({match.scoreB})
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </SectionCard>
+            {active.length === 0 && upcoming.length === 0 && (
+              <SectionCard title="Нет активных турниров" accent="default">
+                <div className="empty-state">
+                  {isAdmin
+                    ? 'Создайте турнир кнопкой «+ Создать турнир» выше.'
+                    : 'Ожидайте начала турнира.'}
+                </div>
+              </SectionCard>
+            )}
 
+            {/* ── Global Leaderboard ── */}
+            <GlobalLeaderboard tournaments={tournaments} />
+
+            {/* ── Previous tournaments ── */}
             <PreviousTournaments
-              tournaments={archivedTournaments}
+              tournaments={tournaments}
               isAdmin={isAdmin}
-              openedId={archiveOpenId}
-              onToggle={setArchiveOpenId}
-              onDelete={deleteArchivedTournament}
+              onDelete={deleteTournament}
             />
+
           </div>
 
+          {/* ── Sidebar ── */}
           <aside className="workspace-grid__side">
-            <SectionCard
-              title="Viewer Guidance"
-              subtitle="Keep the viewer flow obvious, especially on phones."
-              accent="sand"
-            >
-              <div className="checklist">
-                <div className="checklist__item">Refresh after the admin publishes a new draft.</div>
-                <div className="checklist__item">Only published changes are visible to everyone.</div>
-                <div className="checklist__item">The Finish action is idempotent and no longer creates duplicate archives.</div>
-                <div className="checklist__item">Old tournaments can be deleted from admin mode.</div>
-              </div>
-            </SectionCard>
+            {nextUpcoming && (
+              <SectionCard title="Ближайший турнир" accent="mint">
+                <div className="sidebar-event">
+                  <div className="sidebar-event__name">{nextUpcoming.name}</div>
+                  {nextUpcoming.scheduledAt && (
+                    <div className="sidebar-event__date">{formatDateTime(nextUpcoming.scheduledAt)}</div>
+                  )}
+                  <div className="sidebar-event__meta">{typeLabel(nextUpcoming.type, nextUpcoming.format)}</div>
+                  {nextUpcoming.players.length > 0 && (
+                    <>
+                      <div className="sidebar-event__players-title">
+                        {nextUpcoming.players.length} игроков:
+                      </div>
+                      <div className="sidebar-players">
+                        {nextUpcoming.players.map(p => (
+                          <span key={p.id} className="sidebar-player">{p.name}</span>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </SectionCard>
+            )}
 
-            <SectionCard
-              title="Admin Rules"
-              subtitle="A few guardrails prevent bad tournament state."
-              accent="mint"
-            >
-              <div className="checklist">
-                <div className="checklist__item">Roster editing is locked once play starts.</div>
-                <div className="checklist__item">Rounds cannot finalize until every score is entered.</div>
-                <div className="checklist__item">Finishing requires at least one finalized round.</div>
-                <div className="checklist__item">Publish after major edits so viewers get the latest standings.</div>
-              </div>
-            </SectionCard>
+            {active.map(t => {
+              const top5 = sortPlayers(t.players).slice(0, 5)
+              return (
+                <SectionCard key={t.id} title={t.name} subtitle="Текущие лидеры" accent="sand">
+                  <div className="mini-grid">
+                    {top5.map((p, i) => (
+                      <div key={p.id} className="mini-grid__row">
+                        <div>#{i + 1} {p.name}</div>
+                        <div>{p.points} очк.</div>
+                      </div>
+                    ))}
+                  </div>
+                </SectionCard>
+              )
+            })}
           </aside>
         </div>
       </main>
+
+      {showCreate && (
+        <TournamentModal onSave={handleCreate} onClose={() => setShowCreate(false)} />
+      )}
+      {editTarget && (
+        <TournamentModal
+          initial={editTarget}
+          onSave={handleSaveEdit}
+          onClose={() => setEditTarget(null)}
+        />
+      )}
     </div>
   )
 }
