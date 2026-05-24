@@ -10,6 +10,7 @@ const defaultState = {
   history: [],
   finished: false,
   archivedTournaments: [],
+  completedTournamentSignature: null,
 }
 
 function jsonResponse(body, init = {}) {
